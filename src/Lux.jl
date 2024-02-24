@@ -5,7 +5,7 @@ import PrecompileTools
 PrecompileTools.@recompile_invalidations begin
     using Reexport
     using LuxCore, LuxLib, LuxDeviceUtils, WeightInitializers
-    using LinearAlgebra, Markdown, Random, SparseArrays, Statistics
+    using LinearAlgebra, Markdown, Random, Statistics
     using Adapt, ConcreteStructs, Functors, Setfield
     using ChainRulesCore
     using ArrayInterface, GPUArraysCore
@@ -53,6 +53,9 @@ include("transform/types.jl")
 include("transform/flux.jl")
 include("transform/simplechains.jl")
 
+# Distributed Training
+include("distributed/backend.jl")
+
 # Deprecations
 include("deprecated.jl")
 
@@ -74,5 +77,7 @@ export StatefulLuxLayer
 export f16, f32, f64
 
 export transform, FromFluxAdaptor, ToSimpleChainsAdaptor, FluxLayer, SimpleChainsLayer
+
+export NCCLBackend
 
 end
