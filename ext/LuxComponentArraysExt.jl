@@ -76,4 +76,11 @@ end
 # Definitely needs an upstream :P
 @truncate_stacktrace ComponentArray 1
 
+# Distributed Functionality
+function DistributedUtils.synchronize!!(
+        backend::Lux.AbstractLuxDistributedBackend, ps::ComponentArray; root::Int=0)
+    ps_synced = DistributedUtils.synchronize!!(backend, getdata(ps); root)
+    return ComponentArray(ps_synced, getaxes(ps))
+end
+
 end
