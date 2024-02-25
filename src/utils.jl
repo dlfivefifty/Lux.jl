@@ -230,3 +230,5 @@ end
 @inline _pairs(x) = pairs(x)
 
 @inline __value(x) = x
+
+function __set_device! end

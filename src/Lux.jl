@@ -24,6 +24,8 @@ const CRC = ChainRulesCore
 
 const NAME_TYPE = Union{Nothing, String, Symbol}
 
+@inline __is_extension_loaded(x) = Val(false)
+
 # Utilities
 include("utils.jl")
 
@@ -55,6 +57,7 @@ include("transform/simplechains.jl")
 
 # Distributed Training
 include("distributed/backend.jl")
+include("distributed/public_api.jl")
 
 # Deprecations
 include("deprecated.jl")
@@ -78,6 +81,6 @@ export f16, f32, f64
 
 export transform, FromFluxAdaptor, ToSimpleChainsAdaptor, FluxLayer, SimpleChainsLayer
 
-export NCCLBackend
+export MPIBackend, NCCLBackend, DistributedUtils
 
 end
