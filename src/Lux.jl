@@ -9,6 +9,7 @@ PrecompileTools.@recompile_invalidations begin
     using Adapt, ConcreteStructs, Functors, Setfield
     using ChainRulesCore
     using ArrayInterface, GPUArraysCore
+    import Preferences: @load_preference
     import TruncatedStacktraces: TruncatedStacktraces, @truncate_stacktrace
 
     import LuxCore: AbstractExplicitLayer, AbstractExplicitContainerLayer,
