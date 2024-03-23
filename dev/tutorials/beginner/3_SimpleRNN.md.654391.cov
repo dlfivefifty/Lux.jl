@@ -1,0 +1,511 @@
+       54 ```@meta
+        1 EditURL = "../../../../examples/SimpleRNN/main.jl"
+        3 ```
+        - 
+        1 # Training a Simple LSTM
+       52 
+      451 In this tutorial we will go over using a recurrent neural network to classify clockwise
+      851 and anticlockwise spirals. By the end of this tutorial you will be able to:
+      401 
+        1 1. Create custom Lux models.
+       51 2. Become familiar with the Lux recurrent neural network API.
+    10075 3. Training using Optimisers.jl and Zygote.jl.
+    20002 
+    28175 ## Package Imports
+       26 
+      675 ````julia
+      225 using ADTypes, Lux, LuxAMDGPU, LuxCUDA, JLD2, MLUtils, Optimisers, Zygote, Printf, Random,
+      400       Statistics
+      750 ````
+        - 
+      175 ## Dataset
+        - 
+      175 We will use MLUtils to generate 500 (noisy) clockwise and 500 (noisy) anticlockwise
+      175 spirals. Using this data we will create a `MLUtils.DataLoader`. Our dataloader will give
+        - us sequences of size 2 × seq_len × batch_size and we need to predict a binary value
+        - whether the sequence is clockwise or anticlockwise.
+       25 
+       25 ````julia
+       50 function get_dataloaders(; dataset_size=1000, sequence_length=50)
+       50     # Create the spirals
+       50     data = [MLUtils.Datasets.make_spiral(sequence_length) for _ in 1:dataset_size]
+       50     # Get the labels
+       50     labels = vcat(repeat([0.0f0], dataset_size ÷ 2), repeat([1.0f0], dataset_size ÷ 2))
+       50     clockwise_spirals = [reshape(d[1][:, 1:sequence_length], :, sequence_length, 1)
+       49                          for d in data[1:(dataset_size ÷ 2)]]
+        -     anticlockwise_spirals = [reshape(
+        1                                  d[1][:, (sequence_length + 1):end], :, sequence_length, 1)
+        -                              for d in data[((dataset_size ÷ 2) + 1):end]]
+        -     x_data = Float32.(cat(clockwise_spirals..., anticlockwise_spirals...; dims=3))
+        -     # Split the dataset
+        -     (x_train, y_train), (x_val, y_val) = splitobs((x_data, labels); at=0.8, shuffle=true)
+        -     # Create DataLoaders
+        -     return (
+        -         # Use DataLoader to automatically minibatch and shuffle the data
+        -         DataLoader(collect.((x_train, y_train)); batchsize=128, shuffle=true),
+        -         # Don't shuffle the validation data
+        -         DataLoader(collect.((x_val, y_val)); batchsize=128, shuffle=false))
+        - end
+        - ````
+        - 
+        - ````
+        - get_dataloaders (generic function with 1 method)
+        - ````
+        - 
+        - ## Creating a Classifier
+        - 
+        - We will be extending the `Lux.AbstractExplicitContainerLayer` type for our custom model
+        - since it will contain a lstm block and a classifier head.
+        - 
+        - We pass the fieldnames `lstm_cell` and `classifier` to the type to ensure that the
+        - parameters and states are automatically populated and we don't have to define
+        - `Lux.initialparameters` and `Lux.initialstates`.
+        - 
+        - To understand more about container layers, please look at
+        - [Container Layer](@ref Container-Layer).
+        - 
+        - ````julia
+        - struct SpiralClassifier{L, C} <:
+        -        Lux.AbstractExplicitContainerLayer{(:lstm_cell, :classifier)}
+        -     lstm_cell::L
+        -     classifier::C
+        - end
+        - ````
+        - 
+        - We won't define the model from scratch but rather use the [`Lux.LSTMCell`](@ref) and
+        - [`Lux.Dense`](@ref).
+        - 
+        - ````julia
+        - function SpiralClassifier(in_dims, hidden_dims, out_dims)
+        -     return SpiralClassifier(
+        -         LSTMCell(in_dims => hidden_dims), Dense(hidden_dims => out_dims, sigmoid))
+        - end
+        - ````
+        - 
+        - ````
+        - Main.var"##225".SpiralClassifier
+        - ````
+        - 
+        - We can use default Lux blocks -- `Recurrence(LSTMCell(in_dims => hidden_dims)` -- instead
+        - of defining the following. But let's still do it for the sake of it.
+        - 
+        - Now we need to define the behavior of the Classifier when it is invoked.
+        - 
+        - ````julia
+        - function (s::SpiralClassifier)(
+        -         x::AbstractArray{T, 3}, ps::NamedTuple, st::NamedTuple) where {T}
+        -     # First we will have to run the sequence through the LSTM Cell
+        -     # The first call to LSTM Cell will create the initial hidden state
+        -     # See that the parameters and states are automatically populated into a field called
+        -     # `lstm_cell` We use `eachslice` to get the elements in the sequence without copying,
+        -     # and `Iterators.peel` to split out the first element for LSTM initialization.
+        -     x_init, x_rest = Iterators.peel(Lux._eachslice(x, Val(2)))
+        -     (y, carry), st_lstm = s.lstm_cell(x_init, ps.lstm_cell, st.lstm_cell)
+        -     # Now that we have the hidden state and memory in `carry` we will pass the input and
+        -     # `carry` jointly
+        -     for x in x_rest
+        -         (y, carry), st_lstm = s.lstm_cell((x, carry), ps.lstm_cell, st_lstm)
+        -     end
+        -     # After running through the sequence we will pass the output through the classifier
+        -     y, st_classifier = s.classifier(y, ps.classifier, st.classifier)
+        -     # Finally remember to create the updated state
+        -     st = merge(st, (classifier=st_classifier, lstm_cell=st_lstm))
+        -     return vec(y), st
+        - end
+        - ````
+        - 
+        - ## Defining Accuracy, Loss and Optimiser
+        - 
+        - Now let's define the binarycrossentropy loss. Typically it is recommended to use
+        - `logitbinarycrossentropy` since it is more numerically stable, but for the sake of
+        - simplicity we will use `binarycrossentropy`.
+        - 
+        - ````julia
+        - function xlogy(x, y)
+        -     result = x * log(y)
+        -     return ifelse(iszero(x), zero(result), result)
+        - end
+        - 
+        - function binarycrossentropy(y_pred, y_true)
+        -     y_pred = y_pred .+ eps(eltype(y_pred))
+        -     return mean(@. -xlogy(y_true, y_pred) - xlogy(1 - y_true, 1 - y_pred))
+        - end
+        - 
+        - function compute_loss(model, ps, st, (x, y))
+        -     y_pred, st = model(x, ps, st)
+        -     return binarycrossentropy(y_pred, y), st, (; y_pred=y_pred)
+        - end
+        - 
+        - matches(y_pred, y_true) = sum((y_pred .> 0.5f0) .== y_true)
+        - accuracy(y_pred, y_true) = matches(y_pred, y_true) / length(y_pred)
+        - ````
+        - 
+        - ````
+        - accuracy (generic function with 1 method)
+        - ````
+        - 
+        - ## Training the Model
+        - 
+        - ````julia
+        - function main()
+        -     # Get the dataloaders
+        -     (train_loader, val_loader) = get_dataloaders()
+        - 
+        -     # Create the model
+        -     model = SpiralClassifier(2, 8, 1)
+        -     rng = Xoshiro(0)
+        - 
+        -     dev = gpu_device()
+        -     train_state = Lux.Experimental.TrainState(
+        -         rng, model, Adam(0.01f0); transform_variables=dev)
+        - 
+        -     for epoch in 1:25
+        -         # Train the model
+        -         for (x, y) in train_loader
+        -             x = x |> dev
+        -             y = y |> dev
+        - 
+        -             gs, loss, _, train_state = Lux.Experimental.compute_gradients(
+        -                 AutoZygote(), compute_loss, (x, y), train_state)
+        -             train_state = Lux.Experimental.apply_gradients(train_state, gs)
+        - 
+        -             @printf "Epoch [%3d]: Loss %4.5f\n" epoch loss
+        -         end
+        - 
+        -         # Validate the model
+        -         st_ = Lux.testmode(train_state.states)
+        -         for (x, y) in val_loader
+        -             x = x |> dev
+        -             y = y |> dev
+        -             loss, st_, ret = compute_loss(model, train_state.parameters, st_, (x, y))
+        -             acc = accuracy(ret.y_pred, y)
+        -             @printf "Validation: Loss %4.5f Accuracy %4.5f\n" loss acc
+        -         end
+        -     end
+        - 
+        -     return (train_state.parameters, train_state.states) |> cpu_device()
+        - end
+        - 
+        - ps_trained, st_trained = main()
+        - ````
+        - 
+        - ````
+        - Epoch [  1]: Loss 0.56079
+        - Epoch [  1]: Loss 0.51450
+        - Epoch [  1]: Loss 0.47565
+        - Epoch [  1]: Loss 0.44652
+        - Epoch [  1]: Loss 0.41971
+        - Epoch [  1]: Loss 0.41051
+        - Epoch [  1]: Loss 0.42859
+        - Validation: Loss 0.36875 Accuracy 1.00000
+        - Validation: Loss 0.36979 Accuracy 1.00000
+        - Epoch [  2]: Loss 0.36584
+        - Epoch [  2]: Loss 0.35689
+        - Epoch [  2]: Loss 0.33528
+        - Epoch [  2]: Loss 0.31975
+        - Epoch [  2]: Loss 0.30374
+        - Epoch [  2]: Loss 0.28977
+        - Epoch [  2]: Loss 0.27775
+        - Validation: Loss 0.26040 Accuracy 1.00000
+        - Validation: Loss 0.26120 Accuracy 1.00000
+        - Epoch [  3]: Loss 0.26220
+        - Epoch [  3]: Loss 0.24506
+        - Epoch [  3]: Loss 0.23988
+        - Epoch [  3]: Loss 0.22268
+        - Epoch [  3]: Loss 0.21270
+        - Epoch [  3]: Loss 0.20412
+        - Epoch [  3]: Loss 0.19232
+        - Validation: Loss 0.18353 Accuracy 1.00000
+        - Validation: Loss 0.18402 Accuracy 1.00000
+        - Epoch [  4]: Loss 0.18460
+        - Epoch [  4]: Loss 0.17445
+        - Epoch [  4]: Loss 0.16575
+        - Epoch [  4]: Loss 0.15848
+        - Epoch [  4]: Loss 0.15424
+        - Epoch [  4]: Loss 0.14631
+        - Epoch [  4]: Loss 0.13780
+        - Validation: Loss 0.13242 Accuracy 1.00000
+        - Validation: Loss 0.13276 Accuracy 1.00000
+        - Epoch [  5]: Loss 0.13179
+        - Epoch [  5]: Loss 0.12797
+        - Epoch [  5]: Loss 0.12070
+        - Epoch [  5]: Loss 0.11610
+        - Epoch [  5]: Loss 0.11254
+        - Epoch [  5]: Loss 0.10696
+        - Epoch [  5]: Loss 0.09717
+        - Validation: Loss 0.09727 Accuracy 1.00000
+        - Validation: Loss 0.09757 Accuracy 1.00000
+        - Epoch [  6]: Loss 0.09723
+        - Epoch [  6]: Loss 0.09357
+        - Epoch [  6]: Loss 0.09076
+        - Epoch [  6]: Loss 0.08706
+        - Epoch [  6]: Loss 0.08037
+        - Epoch [  6]: Loss 0.07933
+        - Epoch [  6]: Loss 0.07389
+        - Validation: Loss 0.07231 Accuracy 1.00000
+        - Validation: Loss 0.07260 Accuracy 1.00000
+        - Epoch [  7]: Loss 0.07305
+        - Epoch [  7]: Loss 0.07085
+        - Epoch [  7]: Loss 0.06711
+        - Epoch [  7]: Loss 0.06477
+        - Epoch [  7]: Loss 0.06119
+        - Epoch [  7]: Loss 0.05755
+        - Epoch [  7]: Loss 0.05569
+        - Validation: Loss 0.05424 Accuracy 1.00000
+        - Validation: Loss 0.05450 Accuracy 1.00000
+        - Epoch [  8]: Loss 0.05550
+        - Epoch [  8]: Loss 0.05243
+        - Epoch [  8]: Loss 0.05093
+        - Epoch [  8]: Loss 0.04734
+        - Epoch [  8]: Loss 0.04545
+        - Epoch [  8]: Loss 0.04596
+        - Epoch [  8]: Loss 0.03878
+        - Validation: Loss 0.04089 Accuracy 1.00000
+        - Validation: Loss 0.04110 Accuracy 1.00000
+        - Epoch [  9]: Loss 0.04194
+        - Epoch [  9]: Loss 0.03940
+        - Epoch [  9]: Loss 0.03887
+        - Epoch [  9]: Loss 0.03608
+        - Epoch [  9]: Loss 0.03438
+        - Epoch [  9]: Loss 0.03504
+        - Epoch [  9]: Loss 0.02872
+        - Validation: Loss 0.03125 Accuracy 1.00000
+        - Validation: Loss 0.03143 Accuracy 1.00000
+        - Epoch [ 10]: Loss 0.02996
+        - Epoch [ 10]: Loss 0.03055
+        - Epoch [ 10]: Loss 0.02796
+        - Epoch [ 10]: Loss 0.02852
+        - Epoch [ 10]: Loss 0.02814
+        - Epoch [ 10]: Loss 0.02792
+        - Epoch [ 10]: Loss 0.02712
+        - Validation: Loss 0.02462 Accuracy 1.00000
+        - Validation: Loss 0.02477 Accuracy 1.00000
+        - Epoch [ 11]: Loss 0.02365
+        - Epoch [ 11]: Loss 0.02320
+        - Epoch [ 11]: Loss 0.02451
+        - Epoch [ 11]: Loss 0.02348
+        - Epoch [ 11]: Loss 0.02229
+        - Epoch [ 11]: Loss 0.02164
+        - Epoch [ 11]: Loss 0.01900
+        - Validation: Loss 0.02003 Accuracy 1.00000
+        - Validation: Loss 0.02016 Accuracy 1.00000
+        - Epoch [ 12]: Loss 0.01974
+        - Epoch [ 12]: Loss 0.01851
+        - Epoch [ 12]: Loss 0.01958
+        - Epoch [ 12]: Loss 0.01938
+        - Epoch [ 12]: Loss 0.01767
+        - Epoch [ 12]: Loss 0.01867
+        - Epoch [ 12]: Loss 0.01840
+        - Validation: Loss 0.01682 Accuracy 1.00000
+        - Validation: Loss 0.01693 Accuracy 1.00000
+        - Epoch [ 13]: Loss 0.01793
+        - Epoch [ 13]: Loss 0.01583
+        - Epoch [ 13]: Loss 0.01561
+        - Epoch [ 13]: Loss 0.01564
+        - Epoch [ 13]: Loss 0.01484
+        - Epoch [ 13]: Loss 0.01611
+        - Epoch [ 13]: Loss 0.01718
+        - Validation: Loss 0.01449 Accuracy 1.00000
+        - Validation: Loss 0.01459 Accuracy 1.00000
+        - Epoch [ 14]: Loss 0.01512
+        - Epoch [ 14]: Loss 0.01365
+        - Epoch [ 14]: Loss 0.01405
+        - Epoch [ 14]: Loss 0.01411
+        - Epoch [ 14]: Loss 0.01335
+        - Epoch [ 14]: Loss 0.01364
+        - Epoch [ 14]: Loss 0.01269
+        - Validation: Loss 0.01273 Accuracy 1.00000
+        - Validation: Loss 0.01282 Accuracy 1.00000
+        - Epoch [ 15]: Loss 0.01382
+        - Epoch [ 15]: Loss 0.01366
+        - Epoch [ 15]: Loss 0.01185
+        - Epoch [ 15]: Loss 0.01203
+        - Epoch [ 15]: Loss 0.01069
+        - Epoch [ 15]: Loss 0.01165
+        - Epoch [ 15]: Loss 0.01347
+        - Validation: Loss 0.01137 Accuracy 1.00000
+        - Validation: Loss 0.01144 Accuracy 1.00000
+        - Epoch [ 16]: Loss 0.01131
+        - Epoch [ 16]: Loss 0.01120
+        - Epoch [ 16]: Loss 0.01169
+        - Epoch [ 16]: Loss 0.01078
+        - Epoch [ 16]: Loss 0.01079
+        - Epoch [ 16]: Loss 0.01072
+        - Epoch [ 16]: Loss 0.01019
+        - Validation: Loss 0.01026 Accuracy 1.00000
+        - Validation: Loss 0.01033 Accuracy 1.00000
+        - Epoch [ 17]: Loss 0.01050
+        - Epoch [ 17]: Loss 0.01014
+        - Epoch [ 17]: Loss 0.01034
+        - Epoch [ 17]: Loss 0.00962
+        - Epoch [ 17]: Loss 0.00967
+        - Epoch [ 17]: Loss 0.01014
+        - Epoch [ 17]: Loss 0.00864
+        - Validation: Loss 0.00935 Accuracy 1.00000
+        - Validation: Loss 0.00941 Accuracy 1.00000
+        - Epoch [ 18]: Loss 0.00908
+        - Epoch [ 18]: Loss 0.00962
+        - Epoch [ 18]: Loss 0.00959
+        - Epoch [ 18]: Loss 0.00833
+        - Epoch [ 18]: Loss 0.00929
+        - Epoch [ 18]: Loss 0.00879
+        - Epoch [ 18]: Loss 0.00987
+        - Validation: Loss 0.00858 Accuracy 1.00000
+        - Validation: Loss 0.00864 Accuracy 1.00000
+        - Epoch [ 19]: Loss 0.00867
+        - Epoch [ 19]: Loss 0.00871
+        - Epoch [ 19]: Loss 0.00872
+        - Epoch [ 19]: Loss 0.00891
+        - Epoch [ 19]: Loss 0.00787
+        - Epoch [ 19]: Loss 0.00790
+        - Epoch [ 19]: Loss 0.00730
+        - Validation: Loss 0.00791 Accuracy 1.00000
+        - Validation: Loss 0.00797 Accuracy 1.00000
+        - Epoch [ 20]: Loss 0.00863
+        - Epoch [ 20]: Loss 0.00724
+        - Epoch [ 20]: Loss 0.00814
+        - Epoch [ 20]: Loss 0.00794
+        - Epoch [ 20]: Loss 0.00747
+        - Epoch [ 20]: Loss 0.00757
+        - Epoch [ 20]: Loss 0.00650
+        - Validation: Loss 0.00734 Accuracy 1.00000
+        - Validation: Loss 0.00739 Accuracy 1.00000
+        - Epoch [ 21]: Loss 0.00705
+        - Epoch [ 21]: Loss 0.00714
+        - Epoch [ 21]: Loss 0.00774
+        - Epoch [ 21]: Loss 0.00725
+        - Epoch [ 21]: Loss 0.00707
+        - Epoch [ 21]: Loss 0.00727
+        - Epoch [ 21]: Loss 0.00652
+        - Validation: Loss 0.00684 Accuracy 1.00000
+        - Validation: Loss 0.00689 Accuracy 1.00000
+        - Epoch [ 22]: Loss 0.00718
+        - Epoch [ 22]: Loss 0.00663
+        - Epoch [ 22]: Loss 0.00711
+        - Epoch [ 22]: Loss 0.00640
+        - Epoch [ 22]: Loss 0.00650
+        - Epoch [ 22]: Loss 0.00658
+        - Epoch [ 22]: Loss 0.00695
+        - Validation: Loss 0.00639 Accuracy 1.00000
+        - Validation: Loss 0.00644 Accuracy 1.00000
+        - Epoch [ 23]: Loss 0.00636
+        - Epoch [ 23]: Loss 0.00592
+        - Epoch [ 23]: Loss 0.00655
+        - Epoch [ 23]: Loss 0.00674
+        - Epoch [ 23]: Loss 0.00634
+        - Epoch [ 23]: Loss 0.00596
+        - Epoch [ 23]: Loss 0.00628
+        - Validation: Loss 0.00599 Accuracy 1.00000
+        - Validation: Loss 0.00604 Accuracy 1.00000
+        - Epoch [ 24]: Loss 0.00621
+        - Epoch [ 24]: Loss 0.00596
+        - Epoch [ 24]: Loss 0.00604
+        - Epoch [ 24]: Loss 0.00574
+        - Epoch [ 24]: Loss 0.00594
+        - Epoch [ 24]: Loss 0.00565
+        - Epoch [ 24]: Loss 0.00591
+        - Validation: Loss 0.00563 Accuracy 1.00000
+        - Validation: Loss 0.00567 Accuracy 1.00000
+        - Epoch [ 25]: Loss 0.00534
+        - Epoch [ 25]: Loss 0.00584
+        - Epoch [ 25]: Loss 0.00521
+        - Epoch [ 25]: Loss 0.00554
+        - Epoch [ 25]: Loss 0.00574
+        - Epoch [ 25]: Loss 0.00560
+        - Epoch [ 25]: Loss 0.00617
+        - Validation: Loss 0.00531 Accuracy 1.00000
+        - Validation: Loss 0.00535 Accuracy 1.00000
+        - 
+        - ````
+        - 
+        - ## Saving the Model
+        - 
+        - We can save the model using JLD2 (and any other serialization library of your choice)
+        - Note that we transfer the model to CPU before saving. Additionally, we recommend that
+        - you don't save the model
+        - 
+        - ````julia
+        - @save "trained_model.jld2" {compress = true} ps_trained st_trained
+        - ````
+        - 
+        - Let's try loading the model
+        - 
+        - ````julia
+        - @load "trained_model.jld2" ps_trained st_trained
+        - ````
+        - 
+        - ````
+        - 2-element Vector{Symbol}:
+        -  :ps_trained
+        -  :st_trained
+        - ````
+        - 
+        - ## Appendix
+        - 
+        - ````julia
+        - using InteractiveUtils
+        - InteractiveUtils.versioninfo()
+        - if @isdefined(LuxCUDA) && CUDA.functional(); println(); CUDA.versioninfo(); end
+        - if @isdefined(LuxAMDGPU) && LuxAMDGPU.functional(); println(); AMDGPU.versioninfo(); end
+        - ````
+        - 
+        - ````
+        - Julia Version 1.10.2
+        - Commit bd47eca2c8a (2024-03-01 10:14 UTC)
+        - Build Info:
+        -   Official https://julialang.org/ release
+        - Platform Info:
+        -   OS: Linux (x86_64-linux-gnu)
+        -   CPU: 48 × AMD EPYC 7402 24-Core Processor
+        -   WORD_SIZE: 64
+        -   LIBM: libopenlibm
+        -   LLVM: libLLVM-15.0.7 (ORCJIT, znver2)
+        - Threads: 48 default, 0 interactive, 24 GC (on 2 virtual cores)
+        - Environment:
+        -   LD_LIBRARY_PATH = /usr/local/nvidia/lib:/usr/local/nvidia/lib64
+        -   JULIA_DEPOT_PATH = /root/.cache/julia-buildkite-plugin/depots/01872db4-8c79-43af-ab7d-12abac4f24f6
+        -   JULIA_PROJECT = /var/lib/buildkite-agent/builds/gpuci-16/julialang/lux-dot-jl/docs/Project.toml
+        -   JULIA_AMDGPU_LOGGING_ENABLED = true
+        -   JULIA_DEBUG = Literate
+        -   JULIA_CPU_THREADS = 2
+        -   JULIA_NUM_THREADS = 48
+        -   JULIA_LOAD_PATH = @:@v#.#:@stdlib
+        -   JULIA_CUDA_HARD_MEMORY_LIMIT = 25%
+        - 
+        - CUDA runtime 12.3, artifact installation
+        - CUDA driver 12.4
+        - NVIDIA driver 550.54.14
+        - 
+        - CUDA libraries: 
+        - - CUBLAS: 12.3.4
+        - - CURAND: 10.3.4
+        - - CUFFT: 11.0.12
+        - - CUSOLVER: 11.5.4
+        - - CUSPARSE: 12.2.0
+        - - CUPTI: 21.0.0
+        - - NVML: 12.0.0+550.54.14
+        - 
+        - Julia packages: 
+        - - CUDA: 5.2.0
+        - - CUDA_Driver_jll: 0.7.0+1
+        - - CUDA_Runtime_jll: 0.11.1+0
+        - 
+        - Toolchain:
+        - - Julia: 1.10.2
+        - - LLVM: 15.0.7
+        - 
+        - Environment:
+        - - JULIA_CUDA_HARD_MEMORY_LIMIT: 25%
+        - 
+        - 2 devices:
+        -   0: Quadro RTX 5000 (sm_75, 15.251 GiB / 16.000 GiB available)
+        -   1: Quadro RTX 5000 (sm_75, 15.729 GiB / 16.000 GiB available)
+        - ┌ Warning: LuxAMDGPU is loaded but the AMDGPU is not functional.
+        - └ @ LuxAMDGPU ~/.cache/julia-buildkite-plugin/depots/01872db4-8c79-43af-ab7d-12abac4f24f6/packages/LuxAMDGPU/sGa0S/src/LuxAMDGPU.jl:19
+        - 
+        - ````
+        - 
+        - ---
+        - 
+        - *This page was generated using [Literate.jl](https://github.com/fredrikekre/Literate.jl).*
+        - 
